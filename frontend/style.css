@@ -1,0 +1,214 @@
+/* Body and HTML styling */
+body,
+html {
+  margin: 0;
+  padding: 0;
+  font-family: Palantino, sans-serif;
+  background-color: #080808e5;
+}
+
+/* Navigation bar styling */
+nav {
+  display: flex;
+  align-items: center;
+  background-color: #000000;
+  padding: 10px 30px;
+  border-bottom: 1px solid #000000;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  z-index: 1000;
+}
+
+/* Title */
+nav title {
+    color: rgb(255, 255, 255);
+    font-size: 24px;
+    font-weight: bold;
+}
+
+
+/* Navigation buttons styling */
+nav button {
+  background-color: rgb(0, 0, 0);
+  color: white;
+  border: none;
+  justify-content: center;
+  padding: 20px 20px;
+  margin: 0 10px;
+  border-radius: 5px;
+  font-size: 25px;
+  cursor: pointer;
+  transition: background-color 0.3s ease;
+}
+nav button:hover {
+  background-color: rgb(0, 0, 0);
+}
+
+/* Text in top left */
+.nav-title {
+    color: white;
+    font-size: 50px;
+    font-weight: bold;
+    margin: 0;
+}
+
+#spotifyLogo {
+  width: 35px;
+  height: 35px;
+  margin-left: 15px;  
+  object-fit: contain;
+  cursor: pointer;
+}
+
+/* Recently Played */
+
+
+#dashboardSongs {
+    text-align: center;
+    margin-top: 50px;
+    color: rgb(255, 255, 255);
+}
+
+
+#recentlyPlayed {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 20px;
+    color: rgb(255, 255, 255);
+}
+
+
+.song-link {
+    text-decoration: none;
+    color: inherit;
+}
+
+#recentlyPlayed {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 20px;
+    width: 90%;
+    margin: 0 auto;
+}
+
+
+.song-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    color: rgb(255, 255, 255);
+    padding: 0px;
+    border-radius: 0px;
+
+    transition: transform 0.2s ease;
+}
+
+
+.song-card img {
+    width: 250px;
+    height: 250px;
+    border-radius: 5px;
+    object-fit: cover;
+}
+
+
+.song-card h3 {
+    font-size: 14px;
+    text-align: center;
+    margin: 8px 0 2px;
+}
+
+
+.song-card p {
+    font-size: 12px;
+    text-align: center;
+    margin: 0;
+}
+
+.song-card:hover {
+
+    transform: scale(1.05);
+    cursor: pointer;
+
+}
+
+#searchBar {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 25px;
+    margin-top: 600px;
+}
+
+#artistSearch {
+    width: 500px;
+    padding: 12px;
+    font-size: 25px;
+    border-radius: 25px;
+    border: 1px solid #ccc;
+}
+
+/* Search button */
+#searchButton {
+    padding: 12px 20px;
+    border-radius: 25px;
+    border: none;
+    background-color: black;
+    color: white;
+    cursor: pointer;
+}
+
+
+/* Results card */
+#artistResults {
+    display: flex;
+    justify-content: center;
+    text-align: center;
+    margin-top: 30px;
+}
+
+
+.artist-card {
+
+    width: 400px;
+    padding: 25px;
+
+    border-radius: 15px; 
+
+    background-color: #f5f5f5;
+
+    box-shadow: 0px 4px 12px rgba(0,0,0,0.15);
+
+}
+
+.artist-image {
+
+    width: 180px;
+    height: 180px;
+
+    border-radius: 50%;
+
+    object-fit: cover;
+
+    margin-bottom: 20px;
+
+}
+
+
+.artist-card h2 {
+
+    margin-top: 0;
+
+}
+
+
+.artist-card ol {
+
+    text-align: left;
+
+}
