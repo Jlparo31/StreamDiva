@@ -4,45 +4,81 @@ const axios = require("axios");
 const querystring = require("querystring");
 const pool = require("./database");
 const importHistory = require("./importHistory");
+require("dotenv").config();
+
 
 const app = express();
+const spotifyCache = new Map();
+const spotifyInFlight = new Map();
+const importLocks = new Map();
+
 
 app.use(express.json());
-
-
-// Serve frontend files
 app.use(express.static(path.join(__dirname, "../frontend")));
+app.disable("x-powered-by");
 
 
-// Test PostgreSQL connection
-app.get("/test-db", async (req, res) => {
-
-    try {
-
-        const result = await pool.query(
-            "SELECT * FROM artists"
-        );
-
-        res.json(result.rows);
-
-    } catch(error) {
-
-        console.error(error);
-        res.status(500).send("Database error");
-
+function getBearerToken(authHeader) {
+    if (!authHeader) {
+        return null;
     }
 
-});
+
+    return authHeader.startsWith("Bearer ")
+        ? authHeader.replace("Bearer ", "")
+        : authHeader;
+}
 
 
+async function getCachedSpotifyData(key, token, requestConfig = {}, ttlMs = 120000) {
+    const cacheKey = `${key}:${token}:${JSON.stringify(requestConfig.params || {})}`;
+    const cached = spotifyCache.get(cacheKey);
+    const now = Date.now();
 
-/*
-    SPOTIFY LOGIN
-*/
 
-// Send user to Spotify authorization
+    if (cached && cached.expiresAt > now) {
+        return cached.data;
+    }
+
+
+    if (spotifyInFlight.has(cacheKey)) {
+        return spotifyInFlight.get(cacheKey);
+    }
+
+
+    const requestPromise = axios.get(
+        `https://api.spotify.com/v1/${key}`,
+        {
+            ...requestConfig,
+            headers: {
+                ...(requestConfig.headers || {}),
+                Authorization: `Bearer ${token}`
+            },
+            timeout: 5000
+        }
+    )
+        .then((response) => {
+            spotifyCache.set(cacheKey, {
+                data: response.data,
+                expiresAt: now + ttlMs
+            });
+
+
+            return response.data;
+        })
+        .finally(() => {
+            spotifyInFlight.delete(cacheKey);
+        });
+
+
+    spotifyInFlight.set(cacheKey, requestPromise);
+
+
+    return requestPromise;
+}
+
+
 app.get("/login", (req, res) => {
-
     const scopes = [
         "user-read-private",
         "user-read-recently-played",
@@ -53,480 +89,250 @@ app.get("/login", (req, res) => {
     const authURL =
         "https://accounts.spotify.com/authorize?" +
         querystring.stringify({
-
             response_type: "code",
             client_id: process.env.SPOTIFY_CLIENT_ID,
             scope: scopes,
             redirect_uri: process.env.SPOTIFY_REDIRECT_URI
-
         });
 
 
     res.redirect(authURL);
-
 });
 
 
-
-
-
-// Spotify callback
 app.get("/callback", async (req, res) => {
-
     const code = req.query.code;
 
 
+    if (!code) {
+        return res.status(400).send("Missing authorization code");
+    }
+
+
     try {
-
         const tokenResponse = await axios.post(
-
             "https://accounts.spotify.com/api/token",
-
             new URLSearchParams({
-
                 grant_type: "authorization_code",
-                code: code,
+                code,
                 redirect_uri: process.env.SPOTIFY_REDIRECT_URI
-
             }),
-
             {
-
                 headers: {
-
-                    "Content-Type":
-                    "application/x-www-form-urlencoded",
-
+                    "Content-Type": "application/x-www-form-urlencoded",
                     Authorization:
-                    "Basic " +
-                    Buffer.from(
-
-                        process.env.SPOTIFY_CLIENT_ID +
-                        ":" +
-                        process.env.SPOTIFY_CLIENT_SECRET
-
-                    ).toString("base64")
-
-                }
-
+                        "Basic " +
+                        Buffer.from(
+                            process.env.SPOTIFY_CLIENT_ID + ":" + process.env.SPOTIFY_CLIENT_SECRET
+                        ).toString("base64")
+                },
+                timeout: 5000
             }
-
         );
 
 
         const accessToken = tokenResponse.data.access_token;
+        console.log("Spotify authentication successful");
 
 
-        res.redirect(
-    "/?token=" + accessToken
-);
-
-
-    } catch(error) {
-
-        console.error(
-            error.response?.data || error.message
-        );
-
-        res.status(500).send(
-            "Spotify authentication failed"
-        );
-
+        res.redirect("/?token=" + encodeURIComponent(accessToken));
+    } catch (error) {
+        console.error(error.response?.data || error.message);
+        res.status(500).send("Spotify authentication failed");
     }
-
 });
 
-
-
-
-
-/*
-    GET SPOTIFY USER
-*/
 
 app.get("/spotify-user", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+
 
     try {
-
-        const response = await axios.get(
-
-            "https://api.spotify.com/v1/me",
-
-            {
-
-                headers: {
-
-                    Authorization:
-                    req.headers.authorization
-
-                }
-
-            }
-
-        );
+        const token = getBearerToken(req.headers.authorization);
 
 
-        res.json(response.data);
-
-
-    } catch(error) {
-
-        console.error(
-            error.response?.data || error.message
-        );
-
-        res.status(500).send(
-            "Could not get Spotify user"
-        );
-
-    }
-
-});
-
-
-
-
-
-/*
-    IMPORT SPOTIFY LISTENING HISTORY
-*/
-
-app.get("/import-history", async (req, res) => {
-
-    try {
-
-        const authHeader = req.headers.authorization;
-
-
-        if (!authHeader) {
-
-            return res.status(401).send(
-                "Missing Spotify access token"
-            );
-
+        if (!token) {
+            return res.status(401).json({ message: "No Spotify token provided" });
         }
 
 
-        const accessToken = authHeader.replace(
-            "Bearer ",
-            ""
-        );
+        const response = await getCachedSpotifyData("me", token, {}, 300000);
 
 
-
-        // Get Spotify user
-        const userResponse = await axios.get(
-
-            "https://api.spotify.com/v1/me",
-
-            {
-
-                headers: {
-
-                    Authorization:
-                    `Bearer ${accessToken}`
-
-                }
-
-            }
-
-        );
-
-
-        const spotifyUser = userResponse.data;
-
-
-
-        // Insert/update user
-        const userResult = await pool.query(
-
-            `
-            INSERT INTO users
-            (
-                spotify_user_id,
-                display_name
-            )
-
-            VALUES ($1,$2)
-
-            ON CONFLICT (spotify_user_id)
-
-            DO UPDATE SET
-
-                display_name =
-                EXCLUDED.display_name
-
-            RETURNING id
-            `,
-
-            [
-
-                spotifyUser.id,
-                spotifyUser.display_name
-
-            ]
-
-        );
-
-
-        const userId = userResult.rows[0].id;
-
-
-
-        // Import listening history
-        await importHistory(
-            accessToken,
-            userId
-        );
-
-
-
-        res.json({
-
-            message:
-            "Listening history imported successfully",
-
-            user:
-            spotifyUser.display_name
-
+        return res.json({
+            id: response.id,
+            display_name: response.display_name,
+            email: response.email,
+            images: response.images
         });
+    } catch (error) {
+        console.error("Spotify user request failed:", error.response?.data || error.message);
 
 
-
-    } catch(error) {
-
-        console.error(
-            error.response?.data || error.message
-        );
-
-
-        res.status(500).send(
-            "Import failed"
-        );
-
+        return res.status(error.response?.status || 500).json({
+            message: "Spotify request failed",
+            error: error.response?.data || error.message
+        });
     }
-
 });
 
-/*
-    GET RECENTLY PLAYED SONGS
-*/
 
-app.get("/recently-played", async (req, res) => {
+app.get("/dashboard", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+
 
     try {
-
-        const response = await axios.get(
-
-            "https://api.spotify.com/v1/me/player/recently-played",
-
-            {
-                headers: {
-                    Authorization: req.headers.authorization
-                },
-
-                params: {
-                    limit: 10
-                }
-            }
-
-        );
+        const userId = req.headers["x-user-id"] || req.query.userId || process.env.DEFAULT_DB_USER_ID || 1;
 
 
-        res.json(response.data.items);
+        const [historyResult, topArtistsResult, topSongsResult, weeklyMinutesResult] = await Promise.all([
+            pool.query(
+                `
+                    SELECT
+                        s.name AS song_name,
+                        a.name AS artist_name,
+                        a.spotify_artist_id,
+                        s.spotify_song_id,
+                        COALESCE(s.album_image_url, '') AS album_image_url,
+                        COALESCE(a.image_url, '') AS artist_image_url,
+                        s.duration_ms,
+                        lh.played_at
+                    FROM listening_history lh
+                    JOIN songs s ON s.id = lh.song_id
+                    JOIN artists a ON a.id = s.artist_id
+                    WHERE lh.user_id = $1
+                    ORDER BY lh.played_at DESC
+                    LIMIT 24
+                `,
+                [userId]
+            ),
+            pool.query(
+                `
+                    SELECT
+                        a.name AS artist_name,
+                        a.spotify_artist_id,
+                        COUNT(*) AS play_count,
+                        COALESCE(a.image_url, '') AS image_url
+                    FROM listening_history lh
+                    JOIN songs s ON s.id = lh.song_id
+                    JOIN artists a ON a.id = s.artist_id
+                    WHERE lh.user_id = $1
+                      AND lh.played_at >= NOW() - INTERVAL '7 days'
+                    GROUP BY a.id, a.name, a.image_url, a.spotify_artist_id
+                    ORDER BY play_count DESC, a.name ASC
+                    LIMIT 5
+                `,
+                [userId]
+            ),
+            pool.query(
+                `
+                    SELECT
+                        s.name AS song_name,
+                        a.name AS artist_name,
+                        a.spotify_artist_id,
+                        s.spotify_song_id,
+                        COALESCE(s.album_image_url, '') AS album_image_url,
+                        COALESCE(a.image_url, '') AS artist_image_url,
+                        COUNT(*) AS play_count,
+                        ROUND(SUM(s.duration_ms) / 60000.0, 1) AS minutes_played
+                    FROM listening_history lh
+                    JOIN songs s ON s.id = lh.song_id
+                    JOIN artists a ON a.id = s.artist_id
+                    WHERE lh.user_id = $1
+                      AND lh.played_at >= NOW() - INTERVAL '7 days'
+                    GROUP BY s.id, s.name, a.name, a.spotify_artist_id, s.spotify_song_id, s.album_image_url, a.image_url
+                    ORDER BY play_count DESC, minutes_played DESC
+                    LIMIT 5
+                `,
+                [userId]
+            ),
+            pool.query(
+                `
+                    SELECT
+                        COALESCE(ROUND(SUM(s.duration_ms) / 60000.0), 0) AS weekly_minutes
+                    FROM listening_history lh
+                    JOIN songs s ON s.id = lh.song_id
+                    WHERE lh.user_id = $1
+                      AND lh.played_at >= NOW() - INTERVAL '7 days'
+                `,
+                [userId]
+            )
+        ]);
 
 
-    } catch(error) {
-
-        console.error(
-            error.response?.data || error.message
-        );
-
-        res.status(500).json({
-
-    message: "Could not get recently played songs",
-
-    error: error.response?.data || error.message
-
-});
-
+        return res.json({
+            weeklyMinutes: Number(weeklyMinutesResult.rows[0]?.weekly_minutes || 0),
+            topArtists: topArtistsResult.rows,
+            topSongs: topSongsResult.rows,
+            history: historyResult.rows,
+            recentlyPlayed: historyResult.rows
+        });
+    } catch (error) {
+        console.error("Dashboard request failed:", error.response?.data || error.message);
+        return res.status(error.response?.status || 500).json({
+            message: "Dashboard request failed",
+            error: error.response?.data || error.message
+        });
     }
-
 });
 
 
-
-/*
-    SEARCH USER LISTENING DATA
-
-    Searches PostgreSQL, not Spotify
-*/
-
-app.get("/artist/:name", async (req, res) => {
-
+app.post("/import-history", async (req, res) => {
     try {
+        const token = getBearerToken(req.headers.authorization);
 
-        const artistName = req.params.name;
+        if (!token) {
+            return res.status(401).json({ message: "No Spotify token provided" });
+        }
 
-
-        // Get artist summary
-        const artistResult = await pool.query(
-
-            `
-            SELECT
-
-                a.name AS artist,
-
-                MIN(lh.played_at)
-                AS first_listened,
-
-                COUNT(lh.id)
-                AS total_streams,
-
-                COALESCE(
-                    SUM(s.duration_ms) / 60000,
-                    0
-                )
-                AS minutes_listened
+        const profile = await getCachedSpotifyData("me", token, {}, 300000);
+        const userId = req.headers["x-user-id"] || profile.id;
 
 
-            FROM artists a
+        // Check if an import is already in progress for this user
+        if (importLocks.has(userId)) {
+            return res.status(202).json({ message: "Import already in progress" });
+        }
 
 
-            LEFT JOIN songs s
-            ON a.id = s.artist_id
-
-
-            LEFT JOIN listening_history lh
-            ON s.id = lh.song_id
-
-
-            WHERE a.name ILIKE $1
-
-
-            GROUP BY a.name
-
-            `,
-
-            [
-                '%${artistName}$%'
-            ]
-
-        );
-
-
-
-        // Artist not found
-        if (artistResult.rows.length === 0) {
-
-            return res.json({
-
-                artist: artistName,
-
-                first_listened: null,
-
-                total_streams: 0,
-
-                minutes_listened: 0,
-
-                top_tracks: []
-
+        const importPromise = importHistory(token, userId)
+            .then(() => ({ message: "History imported successfully" }))
+            .finally(() => {
+                importLocks.delete(userId);
             });
 
-        }
+
+        importLocks.set(userId, importPromise);
 
 
-
-        // Get top 5 songs
-        const songsResult = await pool.query(
-
-            `
-            SELECT
-
-                s.name AS song,
-
-                COUNT(lh.id)
-                AS streams
+        const result = await importPromise;
 
 
-            FROM songs s
+        return res.json(result);
+    } catch (error) {
+        console.error("History import failed:", error.response?.data || error.message);
 
-
-            JOIN artists a
-            ON s.artist_id = a.id
-
-
-            LEFT JOIN listening_history lh
-            ON s.id = lh.song_id
-
-
-            WHERE a.name ILIKE $1
-
-
-            GROUP BY s.name
-
-
-            ORDER BY streams DESC
-
-
-            LIMIT 5
-
-            `,
-
-            [
-                artistName
-            ]
-
-        );
-
-
-
-        res.json({
-
-            artist:
-            artistResult.rows[0].artist,
-
-            first_listened:
-            artistResult.rows[0].first_listened,
-
-            total_streams:
-            Number(
-                artistResult.rows[0].total_streams
-            ),
-
-            minutes_listened:
-            Number(
-                artistResult.rows[0].minutes_listened
-            ),
-
-            top_tracks:
-            songsResult.rows
-
+        return res.status(error.response?.status || 500).json({
+            message: "History import failed",
+            error: error.response?.data || error.message
         });
-
-
-
-    } catch(error) {
-
-        console.error(error);
-
-        res.status(500).send(
-            "Database error"
-        );
-
     }
-
 });
 
 
+async function ensureSongAlbumColumns() {
+    await pool.query(`
+        ALTER TABLE songs
+        ADD COLUMN IF NOT EXISTS album_image_url TEXT,
+        ADD COLUMN IF NOT EXISTS album_name TEXT
+    `);
+}
+
+ensureSongAlbumColumns().catch((error) => {
+    console.error("Schema init failed:", error.message);
+});
 
 
-
-// Start server
 app.listen(3000, () => {
-
-    console.log(
-        "Server running on port 3000"
-    );
-
+    console.log("Server running on port 3000");
 });

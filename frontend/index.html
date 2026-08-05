@@ -27,6 +27,13 @@
         <button id="topArtistsButton">Top Artists</button>
         <button id="topTracksButton">Top Tracks</button>
         <button id="profileButton">Profile</button>
+        <div class="search-container">
+            <input 
+                id="searchBar" 
+                type="text" 
+                placeholder="Search..."
+            >
+        </div>
     </div>
         <a href="https://open.spotify.com" target="_blank">
             <img 
@@ -34,46 +41,103 @@
                 src="https://upload.wikimedia.org/wikipedia/commons/thumb/1/19/Spotify_logo_without_text.svg/1280px-Spotify_logo_without_text.svg.png"
                 alt="Spotify">
         </a>
+    <div class="nav-right">
+
+        <button id="importButton">
+            Import History
+        </button>
     </div>
 
 </nav>
-
-
     <div id="views">
 
-        <div id="dashboardView" class="view active">
+    <div id="dashboardView" class="view active">
 
-            <div id="searchBar">
-                <input 
-                    type="text" 
-                    id="artistSearch"
-                    placeholder="Search an artist..."
-                >
+        <!-- Spotify Weekly Dashboard Cards -->
+<!-- Spotify Weekly Dashboard -->
+<div id="spotifyDashboard">
 
-                <button id="searchButton">
-                    Search
-                </button>
+    <!-- Left Column -->
+    <div id="leftDashboard">
+        <div id="welcomeSection">
+            <h1 id="welcomeText">
+            Welcome
+            </h1>
+            <h2> Here's your listening activity this week</h2>
+        </div>
 
+        <!-- Top Artist -->
+        <div id="topArtistCard" class="dashboard-card">
+
+            <h2>
+                Top Artist This Week
+            </h2>
+
+            <div id="topArtistImages">
             </div>
 
-            <div id="artistResults">
+            <h3 id="topArtist">
+            </h3>
 
+        </div>
+
+        <!-- Top Albums -->
+        <div id="topAlbumsCard" class="dashboard-card">
+
+            <h2>
+                Top Albums This Week
+            </h2>
+
+            <div id="topAlbums">
+                Loading...
             </div>
-
-            <div id="dashboardSongs">
-                
-                <h1> Your Recently Played Songs</h1>
-                <div id="recentlyPlayed">
-                    Loading your Recently Played Songs...
-                </div>
-
-            </div>
-
 
         </div>
 
     </div>
 
+    <!-- Right Column -->
+    <div id="minutesCard" class="dashboard-card">
+
+        <h2>
+            Minutes Listened
+        </h2>
+
+        <p id="weeklyMinutes">
+            Loading...
+        </p>
+
+        <h3>
+            Top Songs This Week
+        </h3>
+
+        <ol id="topSongsList">
+            Loading...
+        </ol>
+
+    </div>
+
+</div>
+
+        <!-- Recently played songs -->
+        <div id="dashboardSongs">
+
+            <h1>
+                Your Recently Played Songs
+            </h1>
+
+            <div class="recently-played-controls">
+                <button id="recentlyPlayedPrev" type="button">←</button>
+                <button id="recentlyPlayedNext" type="button">→</button>
+            </div>
+
+            <div id="recentlyPlayed">
+                Loading your Recently Played Songs...
+            </div>
+
+        </div>
+
+
+</div>
 
 </body>
-    

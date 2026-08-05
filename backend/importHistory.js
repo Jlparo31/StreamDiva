@@ -6,19 +6,30 @@ async function importHistory(accessToken, userId) {
 
 
     const response = await axios.get(
+
         "https://api.spotify.com/v1/me/player/recently-played",
+
         {
             headers: {
-                Authorization: `Bearer ${accessToken}`
+
+                Authorization:
+                `Bearer ${accessToken}`
+
             },
+
             params: {
+
                 limit: 50
+
             }
+
         }
+
     );
 
 
     const tracks = response.data.items;
+
 
 
     for (const item of tracks) {
@@ -26,41 +37,55 @@ async function importHistory(accessToken, userId) {
 
         const track = item.track;
 
-        const artist = track.artists[0];
+        const artist = track.artists[0] || { id: null, name: "Unknown Artist" };
+
+        const albumImage = track.album?.images?.[0]?.url || null;
+
+        const albumName = track.album?.name || null;
 
 
 
         // Insert artist
         const artistResult = await pool.query(
 
-    `
-    INSERT INTO artists
-    (
-        spotify_artist_id,
-        name,
-        image_url
-    )
+            `
+            INSERT INTO artists
+            (
+                spotify_artist_id,
+                name,
+                image_url
+            )
 
-    VALUES ($1,$2,$3)
+            VALUES ($1,$2,$3)
 
-    ON CONFLICT (spotify_artist_id)
+            ON CONFLICT (spotify_artist_id)
 
-    DO UPDATE SET
+            DO UPDATE SET
 
-        name = EXCLUDED.name,
-        image_url = EXCLUDED.image_url
+                name = EXCLUDED.name,
+                image_url = EXCLUDED.image_url
 
-    RETURNING id
-    `,
+            RETURNING id
+            `,
 
-    [
-        artist.id,
-        artist.name,
-        artist.images?.[0]?.url || null
-    ]
+            [
 
-);
-        const artistId = artistResult.rows[0].id;
+                artist.id,
+
+                artist.name,
+
+                null
+
+            ]
+
+        );
+
+
+
+        const artistId =
+        artistResult.rows[0].id;
+
+
 
 
 
@@ -73,28 +98,50 @@ async function importHistory(accessToken, userId) {
                 spotify_song_id,
                 artist_id,
                 name,
-                duration_ms
+                duration_ms,
+                album_name,
+                album_image_url
             )
 
-            VALUES ($1,$2,$3,$4)
+            VALUES ($1,$2,$3,$4,$5,$6)
 
             ON CONFLICT (spotify_song_id)
-            DO UPDATE SET name = EXCLUDED.name
+
+            DO UPDATE SET
+
+                name = EXCLUDED.name,
+                duration_ms = EXCLUDED.duration_ms,
+                album_name = EXCLUDED.album_name,
+                album_image_url = EXCLUDED.album_image_url
 
             RETURNING id
+
             `,
 
             [
+
                 track.id,
+
                 artistId,
+
                 track.name,
-                track.duration_ms
+
+                track.duration_ms,
+
+                albumName,
+
+                albumImage
+
             ]
 
         );
 
 
-        const songId = songResult.rows[0].id;
+
+        const songId =
+        songResult.rows[0].id;
+
+
 
 
 
@@ -114,9 +161,13 @@ async function importHistory(accessToken, userId) {
             `,
 
             [
+
                 userId,
+
                 songId,
+
                 item.played_at
+
             ]
 
         );
@@ -126,6 +177,7 @@ async function importHistory(accessToken, userId) {
 
 
 }
+
 
 
 module.exports = importHistory;
