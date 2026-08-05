@@ -11,6 +11,13 @@ const app = express();
 const spotifyCache = new Map();
 const spotifyInFlight = new Map();
 const importLocks = new Map();
+const wikiCache = new Map();
+const syncState = new Map();
+let lastDashboardSnapshot = null;
+
+const DASHBOARD_SYNC_COOLDOWN_MS = 120000;
+const DASHBOARD_SYNC_MAX_BACKOFF_MS = 120000;
+const DASHBOARD_STALE_WINDOW_MS = 180000;
 
 
 app.use(express.json());
@@ -73,16 +80,241 @@ async function getCachedSpotifyData(key, token, requestConfig = {}, ttlMs = 1200
 
     spotifyInFlight.set(cacheKey, requestPromise);
 
+    try {
+        return await requestPromise;
+    } catch (error) {
+        if (error.response?.status === 429 && cached?.data) {
+            spotifyCache.set(cacheKey, {
+                data: cached.data,
+                expiresAt: now + ttlMs
+            });
 
-    return requestPromise;
+            return cached.data;
+        }
+
+        throw error;
+    }
 }
 
+async function getLiveDashboardSnapshot(token) {
+    const recentlyPlayedItems = [];
+    let before = null;
+
+    for (let page = 0; page < 4; page += 1) {
+        const requestConfig = {
+            params: {
+                limit: 50
+            }
+        };
+
+        if (before) {
+            requestConfig.params.before = before;
+        }
+
+        const recentPlayedResponse = await getCachedSpotifyData(
+            "me/player/recently-played",
+            token,
+            requestConfig,
+            600000
+        );
+
+        const pageItems = recentPlayedResponse?.items || [];
+
+        if (!pageItems.length) {
+            break;
+        }
+
+        recentlyPlayedItems.push(...pageItems);
+
+        const oldestPlayedAt = pageItems[pageItems.length - 1]?.played_at;
+        if (!oldestPlayedAt) {
+            break;
+        }
+
+        before = new Date(oldestPlayedAt).getTime() - 1;
+
+        if (pageItems.length < 50) {
+            break;
+        }
+    }
+
+    const recentlyPlayed = recentlyPlayedItems
+        .sort((a, b) => new Date(b.played_at || 0) - new Date(a.played_at || 0))
+        .map((item) => {
+        const track = item.track || {};
+        const artist = track.artists?.[0] || {};
+
+        return {
+            song_name: track.name || "Unknown Track",
+            artist_name: artist.name || "Unknown Artist",
+            spotify_artist_id: artist.id || null,
+            spotify_song_id: track.id || null,
+            album_image_url: track.album?.images?.[0]?.url || "",
+            artist_image_url: "",
+            duration_ms: track.duration_ms || 0,
+            played_at: item.played_at || null
+        };
+        });
+
+    const artistAggregates = new Map();
+    const songAggregates = new Map();
+
+    for (const item of recentlyPlayed) {
+        const artistKey = item.spotify_artist_id || item.artist_name;
+        const songKey = item.spotify_song_id || `${item.song_name}:${item.artist_name}`;
+
+        const artistEntry = artistAggregates.get(artistKey) || {
+            artist_name: item.artist_name,
+            spotify_artist_id: item.spotify_artist_id,
+            image_url: "",
+            play_count: 0,
+            minutes_played: 0
+        };
+
+        if (!artistEntry.image_url && item.album_image_url) {
+            artistEntry.image_url = item.album_image_url;
+        }
+
+        artistEntry.play_count += 1;
+        artistEntry.minutes_played += (item.duration_ms || 0) / 60000;
+        artistAggregates.set(artistKey, artistEntry);
+
+        const songEntry = songAggregates.get(songKey) || {
+            song_name: item.song_name,
+            artist_name: item.artist_name,
+            spotify_artist_id: item.spotify_artist_id,
+            spotify_song_id: item.spotify_song_id,
+            album_image_url: item.album_image_url || "",
+            artist_image_url: "",
+            play_count: 0,
+            minutes_played: 0
+        };
+
+        songEntry.play_count += 1;
+        songEntry.minutes_played += (item.duration_ms || 0) / 60000;
+        songAggregates.set(songKey, songEntry);
+    }
+
+    const topArtists = Array.from(artistAggregates.values())
+        .sort((a, b) => b.play_count - a.play_count || a.artist_name.localeCompare(b.artist_name))
+        .sort((a, b) => b.minutes_played - a.minutes_played || a.artist_name.localeCompare(b.artist_name))
+        .slice(0, 6)
+        .map((artist) => ({
+            ...artist,
+            minutes_played: Number(artist.minutes_played.toFixed(1))
+        }));
+
+    const topArtistsWithImages = await Promise.all(
+        topArtists.map(async (artist) => {
+            if (!artist.spotify_artist_id) {
+                return artist;
+            }
+
+            try {
+                const artistDetails = await getCachedSpotifyData(
+                    `artists/${artist.spotify_artist_id}`,
+                    token,
+                    {},
+                    86400000
+                );
+
+                return {
+                    ...artist,
+                    image_url: artistDetails?.images?.[0]?.url || artist.image_url || ""
+                };
+            } catch (error) {
+                console.warn("Artist image lookup failed:", error.response?.data || error.message);
+                return artist;
+            }
+        })
+    );
+
+    const topSongs = Array.from(songAggregates.values())
+        .sort((a, b) => b.minutes_played - a.minutes_played || a.song_name.localeCompare(b.song_name))
+        .slice(0, 10)
+        .map((song) => ({
+            ...song,
+            minutes_played: Number(song.minutes_played.toFixed(1))
+        }));
+
+    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    const weeklyMinutes = recentlyPlayed.reduce((total, item) => {
+        if (!item.played_at) {
+            return total;
+        }
+
+        const playedAtMs = new Date(item.played_at).getTime();
+
+        if (Number.isNaN(playedAtMs) || playedAtMs < sevenDaysAgo) {
+            return total;
+        }
+
+        return total + (item.duration_ms || 0);
+    }, 0);
+
+    const dayKey = (date) => {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
+    };
+
+    const dayMinutesMap = new Map();
+    const dayLabelFormatter = new Intl.DateTimeFormat("en-US", { weekday: "short" });
+    const today = new Date();
+
+    for (let offset = 6; offset >= 0; offset -= 1) {
+        const date = new Date(today);
+        date.setHours(0, 0, 0, 0);
+        date.setDate(date.getDate() - offset);
+        dayMinutesMap.set(dayKey(date), 0);
+    }
+
+    for (const item of recentlyPlayed) {
+        if (!item.played_at) {
+            continue;
+        }
+
+        const playedAt = new Date(item.played_at);
+        if (Number.isNaN(playedAt.getTime())) {
+            continue;
+        }
+
+        const key = dayKey(playedAt);
+        if (!dayMinutesMap.has(key)) {
+            continue;
+        }
+
+        const previous = dayMinutesMap.get(key) || 0;
+        dayMinutesMap.set(key, previous + (item.duration_ms || 0));
+    }
+
+    const dailyMinutes = Array.from(dayMinutesMap.entries()).map(([key, valueMs]) => {
+        const date = new Date(`${key}T00:00:00`);
+        return {
+            day: dayLabelFormatter.format(date),
+            minutes: Math.round(valueMs / 60000)
+        };
+    });
+
+    return {
+        weeklyMinutes: Math.round(weeklyMinutes / 60000),
+        dailyMinutes,
+        lastUpdated: recentlyPlayed[0]?.played_at || null,
+        topArtists: topArtistsWithImages,
+        topSongs,
+        history: recentlyPlayed,
+        recentlyPlayed
+    };
+}
 
 app.get("/login", (req, res) => {
     const scopes = [
         "user-read-private",
         "user-read-recently-played",
-        "user-top-read"
+        "user-top-read",
+        "user-read-currently-playing",
+        "user-read-playback-state"
     ].join(" ");
 
 
@@ -132,13 +364,107 @@ app.get("/callback", async (req, res) => {
 
 
         const accessToken = tokenResponse.data.access_token;
+        const refreshToken = tokenResponse.data.refresh_token;
         console.log("Spotify authentication successful");
 
+        syncState.clear();
+        importLocks.clear();
 
-        res.redirect("/?token=" + encodeURIComponent(accessToken));
+        const redirectParams = new URLSearchParams({
+            token: accessToken
+        });
+
+        if (refreshToken) {
+            redirectParams.set("refreshToken", refreshToken);
+        }
+
+        res.redirect("/?" + redirectParams.toString());
     } catch (error) {
         console.error(error.response?.data || error.message);
         res.status(500).send("Spotify authentication failed");
+    }
+});
+
+app.post("/refresh-token", async (req, res) => {
+    const refreshToken = req.body?.refreshToken;
+
+    if (!refreshToken) {
+        return res.status(400).json({ message: "Missing refresh token" });
+    }
+
+    try {
+        const tokenResponse = await axios.post(
+            "https://accounts.spotify.com/api/token",
+            new URLSearchParams({
+                grant_type: "refresh_token",
+                refresh_token: refreshToken
+            }),
+            {
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    Authorization:
+                        "Basic " +
+                        Buffer.from(
+                            process.env.SPOTIFY_CLIENT_ID + ":" + process.env.SPOTIFY_CLIENT_SECRET
+                        ).toString("base64")
+                },
+                timeout: 5000
+            }
+        );
+
+        return res.json({
+            accessToken: tokenResponse.data.access_token,
+            refreshToken: tokenResponse.data.refresh_token || refreshToken
+        });
+    } catch (error) {
+        console.error("Token refresh failed:", error.response?.data || error.message);
+        return res.status(error.response?.status || 500).json({
+            message: "Token refresh failed",
+            error: error.response?.data || error.message
+        });
+    }
+});
+
+
+app.get("/now-playing", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+
+    try {
+        const token = getBearerToken(req.headers.authorization);
+
+        if (!token) {
+            return res.status(401).json({ message: "No Spotify token provided" });
+        }
+
+        const response = await axios.get("https://api.spotify.com/v1/me/player/currently-playing", {
+            headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (response.status === 204 || !response.data || !response.data.item) {
+            return res.json({ is_playing: false });
+        }
+
+        const { item, is_playing, progress_ms } = response.data;
+
+        return res.json({
+            is_playing,
+            progress_ms,
+            duration_ms: item.duration_ms,
+            track_name: item.name,
+            artist_name: item.artists.map(a => a.name).join(", "),
+            album_art: item.album.images[0]?.url || null,
+            spotify_url: item.external_urls?.spotify || null
+        });
+    } catch (error) {
+        // 204 from axios throws on some versions — treat as not playing
+        if (error.response?.status === 204) {
+            return res.json({ is_playing: false });
+        }
+        console.error("Now playing request failed:", error.response?.data || error.message);
+        return res.status(error.response?.status || 500).json({
+            message: "Spotify request failed",
+            error: error.response?.data || error.message
+        });
     }
 });
 
@@ -182,92 +508,43 @@ app.get("/dashboard", async (req, res) => {
 
 
     try {
-        const userId = req.headers["x-user-id"] || req.query.userId || process.env.DEFAULT_DB_USER_ID || 1;
+        const token = getBearerToken(req.headers.authorization);
 
+        if (!token) {
+            return res.status(401).json({ message: "No Spotify token provided" });
+        }
 
-        const [historyResult, topArtistsResult, topSongsResult, weeklyMinutesResult] = await Promise.all([
-            pool.query(
-                `
-                    SELECT
-                        s.name AS song_name,
-                        a.name AS artist_name,
-                        a.spotify_artist_id,
-                        s.spotify_song_id,
-                        COALESCE(s.album_image_url, '') AS album_image_url,
-                        COALESCE(a.image_url, '') AS artist_image_url,
-                        s.duration_ms,
-                        lh.played_at
-                    FROM listening_history lh
-                    JOIN songs s ON s.id = lh.song_id
-                    JOIN artists a ON a.id = s.artist_id
-                    WHERE lh.user_id = $1
-                    ORDER BY lh.played_at DESC
-                    LIMIT 24
-                `,
-                [userId]
-            ),
-            pool.query(
-                `
-                    SELECT
-                        a.name AS artist_name,
-                        a.spotify_artist_id,
-                        COUNT(*) AS play_count,
-                        COALESCE(a.image_url, '') AS image_url
-                    FROM listening_history lh
-                    JOIN songs s ON s.id = lh.song_id
-                    JOIN artists a ON a.id = s.artist_id
-                    WHERE lh.user_id = $1
-                      AND lh.played_at >= NOW() - INTERVAL '7 days'
-                    GROUP BY a.id, a.name, a.image_url, a.spotify_artist_id
-                    ORDER BY play_count DESC, a.name ASC
-                    LIMIT 5
-                `,
-                [userId]
-            ),
-            pool.query(
-                `
-                    SELECT
-                        s.name AS song_name,
-                        a.name AS artist_name,
-                        a.spotify_artist_id,
-                        s.spotify_song_id,
-                        COALESCE(s.album_image_url, '') AS album_image_url,
-                        COALESCE(a.image_url, '') AS artist_image_url,
-                        COUNT(*) AS play_count,
-                        ROUND(SUM(s.duration_ms) / 60000.0, 1) AS minutes_played
-                    FROM listening_history lh
-                    JOIN songs s ON s.id = lh.song_id
-                    JOIN artists a ON a.id = s.artist_id
-                    WHERE lh.user_id = $1
-                      AND lh.played_at >= NOW() - INTERVAL '7 days'
-                    GROUP BY s.id, s.name, a.name, a.spotify_artist_id, s.spotify_song_id, s.album_image_url, a.image_url
-                    ORDER BY play_count DESC, minutes_played DESC
-                    LIMIT 5
-                `,
-                [userId]
-            ),
-            pool.query(
-                `
-                    SELECT
-                        COALESCE(ROUND(SUM(s.duration_ms) / 60000.0), 0) AS weekly_minutes
-                    FROM listening_history lh
-                    JOIN songs s ON s.id = lh.song_id
-                    WHERE lh.user_id = $1
-                      AND lh.played_at >= NOW() - INTERVAL '7 days'
-                `,
-                [userId]
-            )
-        ]);
+        const liveDashboard = await getLiveDashboardSnapshot(token);
 
+        lastDashboardSnapshot = {
+            ...liveDashboard,
+            syncStatus: "live"
+        };
 
         return res.json({
-            weeklyMinutes: Number(weeklyMinutesResult.rows[0]?.weekly_minutes || 0),
-            topArtists: topArtistsResult.rows,
-            topSongs: topSongsResult.rows,
-            history: historyResult.rows,
-            recentlyPlayed: historyResult.rows
+            ...liveDashboard,
+            syncStatus: "live"
         });
     } catch (error) {
+        if (error.response?.status === 429 && lastDashboardSnapshot) {
+            return res.json({
+                ...lastDashboardSnapshot,
+                syncStatus: "cached_rate_limited"
+            });
+        }
+
+        if (error.response?.status === 429) {
+            return res.json({
+                weeklyMinutes: 0,
+                lastUpdated: null,
+                topArtists: [],
+                topSongs: [],
+                history: [],
+                recentlyPlayed: [],
+                syncStatus: "empty_rate_limited"
+            });
+        }
+
         console.error("Dashboard request failed:", error.response?.data || error.message);
         return res.status(error.response?.status || 500).json({
             message: "Dashboard request failed",
@@ -296,7 +573,15 @@ app.post("/import-history", async (req, res) => {
 
 
         const importPromise = importHistory(token, userId)
-            .then(() => ({ message: "History imported successfully" }))
+            .then(() => {
+                const completedAt = Date.now();
+                syncState.set(userId, {
+                    lastSyncedAt: completedAt,
+                    nextAllowedAt: completedAt + DASHBOARD_SYNC_COOLDOWN_MS
+                });
+
+                return { message: "History imported successfully" };
+            })
             .finally(() => {
                 importLocks.delete(userId);
             });
@@ -336,3 +621,29 @@ ensureSongAlbumColumns().catch((error) => {
 app.listen(3000, () => {
     console.log("Server running on port 3000");
 });
+
+async function getArtistBiography(artistName) {
+    const cacheKey = artistName.trim().toLowerCase();
+    const cached = wikiCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && cached.expiresAt > now) {
+        return cached.text;
+    }
+
+    const response = await axios.get(
+        `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(artistName)}`,
+        {
+            timeout: 5000
+        }
+    );
+
+    const biography = response.data.extract || response.data.description || "Biography unavailable.";
+
+    wikiCache.set(cacheKey, {
+        text: biography,
+        expiresAt: now + 3600000
+    });
+
+    return biography;
+}
